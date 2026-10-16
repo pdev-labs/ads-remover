@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ads-remover runtime artefacts (never commit these)
+tools/*.jar
+tools/*.jar.part
+*.apk
+*.keystore
+*.jks
+ads-report.json
+*.report.json
+*.orig-ads
+ads-remover-*/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
