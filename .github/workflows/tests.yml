@@ -20,8 +20,8 @@ jobs:
       - run: python test_remove_ads.py
       - run: python test_cross_platform.py
       - run: python remove_ads.py --help
-      - run: python remove_ads.py --check-deps
-        continue-on-error: true
+      # informational only: exit 3 just means Java/tools are absent on the runner
+      - run: python remove_ads.py --check-deps || true
 
   workflow-lint:
     runs-on: ubuntu-latest
