@@ -3,6 +3,7 @@
 """Cross-platform + UX tests for remove_ads.py (stdlib only, no tools needed)."""
 import io
 import json
+import os
 import sys
 import tempfile
 import zipfile
@@ -95,6 +96,43 @@ check("missing apk exit 2", rc == 2, f"rc={rc}")
 # 7. colour helper degrades with NO_COLOR
 with mock.patch.dict("os.environ", {"NO_COLOR": "1"}):
     check("NO_COLOR strips ansi", ra.c("hi", "green") == "hi")
+
+# 8. Java auto-install plumbing
+check("java packages cover major managers",
+      all(k in ra.JAVA_PACKAGES for k in
+          ("apt", "dnf", "pacman", "zypper", "apk", "pkg")))
+
+# declining the prompt must not run anything and must return False
+with mock.patch.object(ra, "ask_yes_no", return_value=False):
+    res = ra.try_install_java({"is_windows": False, "is_macos": False,
+                               "is_linux": True, "is_termux": False})
+    check("try_install_java declines cleanly", res is False)
+
+# a non-writable/unknown platform must not raise (mock out any real install)
+with mock.patch.object(ra, "run", return_value=mock.Mock(returncode=0)), \
+        mock.patch.object(ra.shutil, "which", return_value=None):
+    res2 = ra.try_install_java({"is_windows": False, "is_macos": False,
+                                "is_linux": False, "is_termux": False,
+                                "system": "plan9"}, auto_yes=True)
+check("try_install_java never raises", res2 in (True, False))
+
+# Arch hint should name the real package
+arch_hint = ra.java_hint({"is_termux": False, "is_windows": False,
+                          "is_macos": False, "is_linux": True})
+check("arch hint package name", "jre-openjdk-headless" in arch_hint, arch_hint)
+
+# 9. find_java on a JAVA_HOME-like dir
+with tempfile.TemporaryDirectory() as td:
+    bindir = Path(td) / "bin"
+    bindir.mkdir()
+    fake_java = bindir / ("java.exe" if os.name == "nt" else "java")
+    fake_java.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_java.chmod(0o755)
+    with mock.patch.dict("os.environ", {"JAVA_HOME": td, "PATH": ""}):
+        found = ra.find_java({"is_windows": False, "is_macos": False,
+                              "is_linux": True, "is_termux": False})
+        # on non-Windows the JAVA_HOME check looks for bin/java
+        check("find_java honours JAVA_HOME", (found or "").startswith(str(Path(td))), str(found))
 
 print("FAILURES:", FAIL)
 sys.exit(1 if FAIL else 0)

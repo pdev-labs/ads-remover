@@ -1,0 +1,216 @@
+name: Process APK (remove ads)
+
+# Run the whole pipeline on GitHub's runners - no Java or tools on your own PC.
+# Three ways to feed it an APK:
+#   1. Actions -> "Process APK (remove ads)" -> Run workflow -> paste a direct APK URL
+#   2. Commit an .apk into input/  (e.g. input/app.apk)
+#   3. Publish a Release with an .apk asset attached
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct HTTPS URL of the APK to process"
+        required: false
+        type: string
+      apk_path:
+        description: "Or a path already in the repo, e.g. input/app.apk"
+        required: false
+        type: string
+      output_name:
+        description: "Name for the patched APK"
+        required: false
+        default: "app-noads.apk"
+        type: string
+      aggressive:
+        description: "Aggressive mode (also stub ad display calls)"
+        required: false
+        default: false
+        type: boolean
+      grant_rewards:
+        description: "Record reward-grant intent (never auto-grants)"
+        required: false
+        default: false
+        type: boolean
+      publish_release:
+        description: "Publish result as a GitHub Release (public download link)"
+        required: false
+        default: true
+        type: boolean
+  push:
+    paths:
+      - "input/*.apk"
+      - "input/**/*.apk"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve request
+        id: req
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_URL: ${{ inputs.apk_url }}
+          IN_PATH: ${{ inputs.apk_path }}
+          OUT_NAME: ${{ inputs.output_name }}
+          IN_AGG: ${{ inputs.aggressive }}
+          IN_GR: ${{ inputs.grant_rewards }}
+          IN_REL: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          url="${IN_URL:-}"
+          path="${IN_PATH:-}"
+          out="${OUT_NAME:-app-noads.apk}"
+          agg="${IN_AGG:-false}"
+          gr="${IN_GR:-false}"
+          rel="${IN_REL:-false}"
+
+          # push event: use the committed APK
+          if [ "${{ github.event_name }}" = "push" ]; then
+            path="$(git ls-files 'input/*.apk' 'input/**/*.apk' | head -n1)"
+          fi
+
+          # release event: use the first .apk asset of the published release
+          if [ "${{ github.event_name }}" = "release" ]; then
+            url="$(gh release view "${{ github.event.release.tag_name }}" \
+              --json assets \
+              --jq '[.assets[] | select(.name | endswith(".apk"))][0].browser_download_url')"
+            # never publish a new release from a release-triggered run (prevents a loop)
+            rel="false"
+          fi
+
+          if [ -z "$url" ] && [ -z "$path" ]; then
+            echo "::error::No APK provided. Give an apk_url, an apk_path, or commit one to input/."
+            exit 1
+          fi
+          if [ -n "$url" ]; then
+            case "$url" in
+              https://*) : ;;
+              *) echo "::error::apk_url must start with https://"; exit 1 ;;
+            esac
+          fi
+
+          {
+            echo "url=$url"
+            echo "path=$path"
+            echo "out=$out"
+            echo "aggressive=$agg"
+            echo "grant_rewards=$gr"
+            echo "release=$rel"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download / locate APK
+        id: get
+        shell: bash
+        env:
+          URL: ${{ steps.req.outputs.url }}
+          PATH_IN: ${{ steps.req.outputs.path }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ -n "${URL:-}" ]; then
+            echo "Downloading $URL"
+            curl -fL --retry 3 --max-time 300 -o work/input.apk "$URL"
+          else
+            echo "Using repo file ${PATH_IN:-}"
+            cp "${PATH_IN:?no input path}" work/input.apk
+          fi
+          ls -l work/input.apk
+          if ! head -c 4 work/input.apk | LC_ALL=C grep -aq "PK"; then
+            echo "::error::Downloaded file is not a valid APK (not a zip)."
+            exit 1
+          fi
+          echo "input=work/input.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Set up tooling (apktool + signer)
+        shell: bash
+        run: python remove_ads.py --setup -y
+
+      - name: Analyse APK (dry run, written to the log)
+        shell: bash
+        continue-on-error: true
+        run: python remove_ads.py "${{ steps.get.outputs.input }}" --dry-run -y
+
+      - name: Remove ads and rebuild
+        id: build
+        shell: bash
+        env:
+          IN: ${{ steps.get.outputs.input }}
+          OUT: work/${{ steps.req.outputs.out }}
+          AGG: ${{ steps.req.outputs.aggressive }}
+          GR: ${{ steps.req.outputs.grant_rewards }}
+        run: |
+          set -euo pipefail
+          args=( "$IN" -o "$OUT" -y )
+          if [ "$AGG" = "true" ]; then args+=( --aggressive ); fi
+          if [ "$GR"  = "true" ]; then args+=( --grant-rewards ); fi
+          python remove_ads.py "${args[@]}"
+          ls -l "$OUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload patched APK (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.req.outputs.out }}
+          path: |
+            work/${{ steps.req.outputs.out }}
+            work/${{ steps.req.outputs.out }}.report.json
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ steps.req.outputs.release == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT: work/${{ steps.req.outputs.out }}
+        run: |
+          set -euo pipefail
+          tag="noads-$(date -u +%Y%m%d-%H%M%S)"
+          notes="$(mktemp)"
+          python - "$OUT" "$notes" <<'PY'
+          import json, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          body = "Automated ad removal by ads-remover.\n\n"
+          try:
+              d = json.load(open(src + ".report.json"))
+              body += "```json\n" + json.dumps({
+                  "manifest_removed_components": len(d.get("manifest_removed_components", [])),
+                  "manifest_removed_permissions": len(d.get("manifest_removed_permissions", [])),
+                  "smali_patched_files": d.get("smali_patched_files", 0),
+                  "layouts_neutralised": len(d.get("layouts_neutralised", [])),
+                  "sdks": list(d.get("smali_patched_sdks", {}).keys()),
+                  "server_ad_hints": len(d.get("server_ad_hints", [])),
+              }, indent=2) + "\n```\n"
+          except Exception as e:
+              body += "(report unavailable: %s)\n" % e
+          open(dst, "w").write(body)
+          PY
+          gh release create "$tag" \
+            --title "Patched APK $tag" \
+            --notes-file "$notes" \
+            "$OUT" "$OUT.report.json"
+          echo "Released: $tag"

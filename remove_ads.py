@@ -295,6 +295,29 @@ def find_java(plat=None):
                             return str(cand)
                 except OSError:
                     continue
+    elif plat["is_macos"]:
+        jh = "/usr/libexec/java_home"
+        if Path(jh).is_file():
+            p = run([jh])
+            home = (p.stdout or "").strip()
+            if p.returncode == 0 and home:
+                cand = Path(home) / "bin" / "java"
+                if cand.is_file():
+                    return str(cand)
+    else:
+        # Linux / Termux: common JVM layouts when java is off-PATH
+        for base in ("/usr/lib/jvm", "/usr/java", "/opt/java",
+                     str(Path(os.environ.get("PREFIX", "/usr")) / "lib/jvm")):
+            p = Path(base)
+            if not p.is_dir():
+                continue
+            try:
+                for d in sorted(p.iterdir(), reverse=True):
+                    cand = d / "bin" / "java"
+                    if cand.is_file():
+                        return str(cand)
+            except OSError:
+                continue
     return None
 
 
@@ -409,9 +432,11 @@ INSTALL_HINTS = {
     "macos_java": "Install Java 17:  brew install openjdk@17",
     "linux_java": (
         "Install Java 17, e.g.:\n"
-        "  Ubuntu/Debian: sudo apt install -y openjdk-17-jre\n"
-        "  Fedora:        sudo dnf install -y java-17-openjdk\n"
-        "  Arch:          sudo pacman -S jre-openjdk"
+        "  Ubuntu/Debian: sudo apt install -y openjdk-17-jre-headless\n"
+        "  Fedora/RHEL:   sudo dnf install -y java-17-openjdk-headless\n"
+        "  Arch:          sudo pacman -S --needed jre-openjdk-headless\n"
+        "  openSUSE:      sudo zypper install -y java-17-openjdk\n"
+        "  Alpine:        sudo apk add openjdk17-jre-headless"
     ),
     "termux_java": "Install Java:  pkg install -y openjdk-17",
 }
@@ -425,6 +450,94 @@ def java_hint(plat):
     if plat["is_macos"]:
         return INSTALL_HINTS["macos_java"]
     return INSTALL_HINTS["linux_java"]
+
+
+# Package manager -> (java package, install argv tail). Used by --setup.
+JAVA_PACKAGES = {
+    "apt": (["openjdk-17-jre-headless"], ["install", "-y"]),
+    "apt-get": (["openjdk-17-jre-headless"], ["install", "-y"]),
+    "dnf": (["java-17-openjdk-headless"], ["install", "-y"]),
+    "yum": (["java-17-openjdk-headless"], ["install", "-y"]),
+    "pacman": (["jre-openjdk-headless"], ["-S", "--noconfirm", "--needed"]),
+    "zypper": (["java-17-openjdk"], ["install", "-y"]),
+    "apk": (["openjdk17-jre-headless"], ["add"]),
+    "pkg": (["openjdk-17"], ["install", "-y"]),  # Termux
+}
+
+
+def _sudo_prefix(plat):
+    if plat["is_windows"]:
+        return []
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    return [sudo] if sudo else []
+
+
+def try_install_java(plat, auto_yes=False):
+    """Best-effort Java install via the platform package manager.
+
+    Returns True if java is available afterwards. Never raises.
+    """
+    # Windows: winget / choco
+    if plat["is_windows"]:
+        winget = shutil.which("winget")
+        choco = shutil.which("choco")
+        if winget and (auto_yes or ask_yes_no(
+                "Java 17 is missing. Install it with winget now?", default=True)):
+            run([winget, "install", "-e", "--accept-source-agreements",
+                 "--accept-package-agreements", "--id",
+                 "EclipseAdoptium.Temurin.17.JRE"])
+        elif choco and (auto_yes or ask_yes_no(
+                "Java 17 is missing. Install it with Chocolatey now?",
+                default=True)):
+            run([choco, "install", "temurin17jre", "-y"])
+        else:
+            return False
+        return find_java(plat) is not None
+
+    # macOS: Homebrew
+    if plat["is_macos"]:
+        brew = shutil.which("brew")
+        if not brew:
+            return False
+        if not (auto_yes or ask_yes_no(
+                "Java 17 is missing. Install it with Homebrew now?", default=True)):
+            return False
+        run([brew, "install", "openjdk@17"])
+        # brew openjdk is keg-only; link it so `java` is on PATH
+        run([brew, "link", "--force", "--overwrite", "openjdk@17"])
+        return find_java(plat) is not None
+
+    # Linux + Termux: find a package manager
+    mgr = None
+    for name in ("apt-get", "apt", "dnf", "yum", "pacman", "zypper", "apk",
+                 "pkg"):
+        if shutil.which(name):
+            mgr = name
+            break
+    if not mgr:
+        return False
+    pkgs, tail = JAVA_PACKAGES.get(mgr, (None, None))
+    if not pkgs:
+        return False
+    if not (auto_yes or ask_yes_no(
+            f"Java 17 is missing. Install it with '{mgr}' now? "
+            "(needs your password)", default=True)):
+        return False
+    cmd = [*_sudo_prefix(plat), mgr, *tail, *pkgs]
+    if mgr in ("apt", "apt-get"):
+        run([*_sudo_prefix(plat), "apt-get", "update"])
+    if mgr == "pkg":
+        run([mgr, "update", "-y"])
+    print(f"  Running: {' '.join(cmd)}")
+    p = run(cmd)
+    if p.returncode != 0:
+        warn(f"'{mgr}' install did not succeed. You may need to run it "
+             "yourself; see the hint below.")
+        return False
+    return find_java(plat) is not None
+
 
 
 def check_deps(tools_dir=DEFAULT_TOOLS_DIR, plat=None):
@@ -882,11 +995,17 @@ def run_setup(tools_dir, auto_yes=False, plat=None):
 
     java = deps["java"]
     if not java:
-        print("\n" + c("Java is the only thing I cannot download for you.", "yellow"))
-        print(java_hint(plat))
-        if plat["is_termux"]:
-            print("Then re-run:  python remove_ads.py --setup")
-        return 1
+        print("\n" + c("Java 17+ is required (apktool needs it).", "yellow"))
+        installed = try_install_java(plat, auto_yes=auto_yes)
+        if not installed:
+            fail("Could not install Java automatically.")
+            print(java_hint(plat))
+            print("After installing it yourself, re-run:  "
+                  "python remove_ads.py --setup")
+            return 1
+        java = find_java(plat)
+        ok(f"Java installed: {java}")
+        deps = check_deps(tools_dir, plat)
 
     native = find_apktool_native(plat)
     if native:
@@ -1076,9 +1195,19 @@ def main(argv=None):
     step(1, total, "Checking tools ...")
     java = find_java(plat)
     if not java:
-        fail("Java 17+ was not found - it is required to unpack apps.")
-        print(java_hint(plat))
-        return 3
+        warn("Java 17+ was not found - it is required to unpack apps.")
+        if args.yes:
+            print("Non-interactive mode: run 'python remove_ads.py --setup -y' "
+                  "to install it first.")
+            print(java_hint(plat))
+            return 3
+        if try_install_java(plat, auto_yes=False):
+            java = find_java(plat)
+            ok(f"Java installed: {java}")
+        else:
+            fail("Java is still missing.")
+            print(java_hint(plat))
+            return 3
     ok(f"Java: {java}")
     prefix, how = apktool_prefix(java, find_apktool_native(plat), tools_dir,
                                  auto_yes=args.yes)

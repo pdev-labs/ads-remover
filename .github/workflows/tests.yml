@@ -8,6 +8,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.9", "3.12"]
@@ -19,3 +20,15 @@ jobs:
       - run: python test_remove_ads.py
       - run: python test_cross_platform.py
       - run: python remove_ads.py --help
+      - run: python remove_ads.py --check-deps
+        continue-on-error: true
+
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - run: python test_workflow.py

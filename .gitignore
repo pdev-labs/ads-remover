@@ -16,6 +16,10 @@ ads-report.json
 *.orig-ads
 ads-remover-*/
 
+# ...except APKs explicitly placed in input/ for the GitHub Actions workflow
+!input/**/*.apk
+!input/*.apk
+
 # OS / editors
 .DS_Store
 Thumbs.db
