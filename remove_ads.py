@@ -225,7 +225,11 @@ def fail(msg):
 
 
 def ask_yes_no(prompt, default=True):
-    """Prompt until y/n/Enter. Returns bool. EOF -> default."""
+    """Prompt until y/n/Enter. Returns bool.
+
+    Enter returns the default. EOF / Ctrl+C returns False (decline) so a piped
+    or unattended run never triggers a side effect such as a package install.
+    """
     hint = "Y/n" if default else "y/N"
     try:
         while True:
@@ -239,7 +243,7 @@ def ask_yes_no(prompt, default=True):
             print("Please answer y or n.")
     except (EOFError, KeyboardInterrupt):
         print()
-        return default
+        return False
 
 
 def ask_path(prompt):
@@ -479,6 +483,9 @@ def try_install_java(plat, auto_yes=False):
 
     Returns True if java is available afterwards. Never raises.
     """
+    # Never install unprompted in a non-interactive shell without -y.
+    if not auto_yes and not sys.stdin.isatty():
+        return False
     # Windows: winget / choco
     if plat["is_windows"]:
         winget = shutil.which("winget")
@@ -1044,14 +1051,24 @@ def run_wizard(args, plat):
     print(c(BANNER, "cyan"))
     print(c("Remove ads from an APK file. No tech skills needed.", "bold"))
     print("I will ask 3 questions, then do the rest.\n")
+    tries = 0
     while True:
         raw = ask_path("Step 1/3 - drag your .apk here (or type its path)")
+        if not raw.strip():
+            # empty input / EOF / Ctrl+C: do not loop forever
+            fail("No file given.")
+            raise KeyboardInterrupt
         good, msg = validate_apk(raw)
         if good:
             args.input = raw
             size_mb = Path(raw).stat().st_size / 1_000_000
             ok(f"Got it: {Path(raw).name} ({size_mb:.1f} MB)")
             break
+        tries += 1
+        if tries >= 5:
+            fail("Too many invalid attempts. Run again, or pass the file: "
+                 "python remove_ads.py yourfile.apk")
+            raise KeyboardInterrupt
         fail(msg + " Try again.")
     default_out = default_output_path(args.input)
     raw = ask_path(f"Step 2/3 - where to save the fixed APK?\n  (press Enter for {default_out})")

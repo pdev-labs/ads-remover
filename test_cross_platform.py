@@ -135,5 +135,29 @@ with tempfile.TemporaryDirectory() as td:
         # on non-Windows the JAVA_HOME check looks for bin/java
         check("find_java honours JAVA_HOME", (found or "").startswith(str(Path(td))), str(found))
 
+# 10. safety: no unprompted side effects
+with mock.patch("builtins.input", side_effect=EOFError):
+    check("ask_yes_no declines on EOF", ra.ask_yes_no("q?", default=True) is False)
+with mock.patch("builtins.input", side_effect=EOFError):
+    check("ask_path empty on EOF", ra.ask_path("p") == "")
+
+# non-tty + no -y must never attempt a package install
+with mock.patch.object(ra.sys.stdin, "isatty", return_value=False), \
+        mock.patch.object(ra, "run") as mocked_run:
+    res = ra.try_install_java({"is_windows": False, "is_macos": False,
+                               "is_linux": True, "is_termux": False},
+                              auto_yes=False)
+    check("no install when non-interactive", res is False and not mocked_run.called)
+
+# wizard aborts cleanly instead of looping on empty input
+with mock.patch.object(ra, "ask_path", return_value=""):
+    aborted = False
+    try:
+        with redirect_stdout(io.StringIO()):
+            ra.run_wizard(mock.Mock(), ra.detect_platform())
+    except KeyboardInterrupt:
+        aborted = True
+    check("wizard aborts on empty input", aborted)
+
 print("FAILURES:", FAIL)
 sys.exit(1 if FAIL else 0)
