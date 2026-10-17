@@ -11,22 +11,29 @@ Quick use:
   python remove_ads.py                  # friendly step-by-step wizard
   python remove_ads.py app.apk          # auto output: app-noads.apk
   python remove_ads.py app.apk -o out.apk --aggressive
+  python remove_ads.py a.apk b.apk -o out/   # batch (folder output)
+  python remove_ads.py --list-sdks       # show the ad SDKs it knows
   python remove_ads.py --setup           # install / download what is missing
   python remove_ads.py --check-deps      # show what is available
 
 Pipeline: apktool decode -> strip ad components from the manifest ->
 stub known ad-SDK methods in smali -> neutralise ad layouts ->
-rebuild + sign (installable on stock devices, no root).
+verify -> rebuild + sign (installable on stock devices, no root).
 
-What it handles: client-side ad SDKs (AdMob, Unity Ads, AppLovin, Facebook
-Audience, ironSource, Vungle, StartApp, InMobi, Chartboost, MoPub, Tapjoy,
-AnyThink/TopOn, Pangle, GDT, KsAd, Mintegral/Sigmob, ...).
+What it handles: client-side ad SDKs across ~55 networks (AdMob, Unity Ads,
+AppLovin, Facebook Audience, ironSource, Vungle, StartApp, InMobi, Chartboost,
+MoPub, Tapjoy, AnyThink/TopOn, Pangle, GDT, KsAd, Mintegral/Sigmob, Amazon,
+Huawei, Smaato, Criteo, Ogury, Teads, BidMachine, Moloco, ...).
 What it flags but does NOT auto-remove: server-driven ads / sponsored
 content, server-validated rewards. Those need a per-app patch; the script
 lists the suspicious spots in the report.
+
+Downloads are SHA-256 verified, and the result is structurally verified before
+it is reported as done.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -38,6 +45,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+
+__version__ = "2.0.0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_TOOLS_DIR = SCRIPT_DIR / "tools"
@@ -55,6 +64,18 @@ UBER_URL = (
     f"v{UBER_VERSION}/{UBER_JAR}"
 )
 
+# SHA-256 of the exact release artefacts above. Downloads are verified against
+# these so a tampered mirror or an HTML error page can never be executed.
+# apktool publishes no checksum file, so the value below was computed from the
+# official release asset; uber-apk-signer's matches its published
+# checksum-sha256.txt. Both are immutable for a fixed release tag.
+TOOL_CHECKSUMS = {
+    APKTOOL_JAR: "7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4",
+    UBER_JAR: "e1299fd6fcf4da527dd53735b56127e8ea922a321128123b9c32d619bba1d835",
+}
+# Toggled off by --no-verify-downloads.
+VERIFY_DOWNLOADS = True
+
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 ET.register_namespace("android", ANDROID_NS)
 ANDROID_NAME = f"{{{ANDROID_NS}}}name"
@@ -63,86 +84,179 @@ ANDROID_NAME = f"{{{ANDROID_NS}}}name"
 # Known ad markers (unchanged patch core)
 # ---------------------------------------------------------------------------
 AD_SDK_SMALI_PREFIXES = {
+    # Google / AdMob / IMA
     "com/google/android/gms/ads": "AdMob",
     "com/google/ads": "AdMob-legacy",
+    "com/google/ads/interactivemedia": "GoogleIMA",
+    # Unity / ironSource / AppLovin
     "com/unity3d/ads": "UnityAds",
     "com/unity3d/services/ads": "UnityAds-services",
     "com/applovin": "AppLovin",
-    "com/facebook/ads": "Facebook-Audience",
     "com/ironsource": "ironSource",
+    # Meta / big western networks
+    "com/facebook/ads": "Facebook-Audience",
     "com/vungle": "Vungle",
     "com/startapp": "StartApp",
     "com/inmobi": "InMobi",
     "com/chartboost": "Chartboost",
     "com/mopub": "MoPub",
     "com/tapjoy": "Tapjoy",
-    "com/anythink": "AnyThink-TopOn",
-    "com/bytedance/sdk/openadsdk": "Pangle",
-    "com/qq/e": "GDT",
-    "com/kwad": "KsAd",
-    "com/mintegral": "Mintegral",
-    "com/sigmob": "Sigmob",
-    "com/baidu/mobads": "Baidu-MobAds",
     "com/adcolony": "AdColony",
     "com/appnext": "AppNext",
     "com/fyber": "Fyber",
     "com/madvertise": "Madvertise",
     "com/millennialmedia": "MillennialMedia",
     "com/flurry": "Flurry-ads",
+    # Chinese / APAC networks
+    "com/anythink": "AnyThink-TopOn",
+    "com/bytedance/sdk/openadsdk": "Pangle",
+    "com/qq/e": "GDT",
+    "com/kwad": "KsAd",
+    "com/mintegral": "Mintegral",
+    "com/mbridge": "Mintegral-MBridge",
+    "com/sigmob": "Sigmob",
+    "com/baidu/mobads": "Baidu-MobAds",
+    # --- added in v2 ---
+    "com/amazon/device/ads": "AmazonAds",
+    "com/amazon/aps": "AmazonAPS",
+    "com/huawei/hms/ads": "HuaweiAds",
+    "com/smaato": "Smaato",
+    "com/criteo": "Criteo",
+    "com/pubnative": "PubNative",
+    "com/ogury": "Ogury",
+    "com/teads": "Teads",
+    "com/loopme": "LoopMe",
+    "com/mobfox": "MobFox",
+    "com/admost": "AdMost",
+    "com/yandex/mobile/ads": "YandexAds",
+    "com/magnite": "Magnite",
+    "com/rubiconproject": "Magnite-Rubicon",
+    "com/bidmachine": "BidMachine",
+    "com/hyprmx": "HyprMX",
+    "com/aerserv": "AerServ",
+    "com/tremor": "Tremor",
+    "com/verizon": "VerizonMedia",
+    "com/oath": "VerizonMedia-Oath",
+    "com/superawesome": "SuperAwesome",
+    "com/kidoz": "Kidoz",
+    "com/moloco": "Moloco",
+    "com/liftoff": "Liftoff",
+    "com/digitalturbine": "DigitalTurbine",
+    "com/zucks": "Zucks",
+    "com/zedo": "Zedo",
 }
 
 AD_MANIFEST_MARKERS = [
     ("com.google.android.gms.ads.adactivity", "AdMob"),
     ("com.google.android.gms.ads", "AdMob"),
+    ("com.google.ads.interactivemedia", "GoogleIMA"),
     ("com.google.ads", "AdMob-legacy"),
     ("com.unity3d.ads", "UnityAds"),
     ("com.applovin", "AppLovin"),
-    ("com.facebook.ads", "Facebook-Audience"),
     ("com.ironsource", "ironSource"),
+    ("com.facebook.ads", "Facebook-Audience"),
     ("com.vungle", "Vungle"),
     ("com.startapp", "StartApp"),
     ("com.inmobi", "InMobi"),
     ("com.chartboost", "Chartboost"),
     ("com.mopub", "MoPub"),
     ("com.tapjoy", "Tapjoy"),
+    ("com.adcolony", "AdColony"),
+    ("com.appnext", "AppNext"),
     ("com.anythink", "AnyThink-TopOn"),
     ("com.bytedance.sdk.openadsdk", "Pangle"),
     ("com.qq.e.", "GDT"),
     ("gdt_plugin", "GDT"),
     ("com.kwad", "KsAd"),
     ("com.mintegral", "Mintegral"),
+    ("com.mbridge", "Mintegral-MBridge"),
     ("com.sigmob", "Sigmob"),
     ("com.baidu.mobads", "Baidu-MobAds"),
-    ("com.adcolony", "AdColony"),
-    ("com.appnext", "AppNext"),
     ("ttad", "Pangle"),
     ("openadsdk", "Pangle"),
     ("pangolin", "Pangle"),
+    # --- added in v2 ---
+    ("com.amazon.device.ads", "AmazonAds"),
+    ("com.amazon.aps", "AmazonAPS"),
+    ("com.huawei.hms.ads", "HuaweiAds"),
+    ("com.smaato", "Smaato"),
+    ("com.criteo", "Criteo"),
+    ("com.pubnative", "PubNative"),
+    ("com.ogury", "Ogury"),
+    ("com.teads", "Teads"),
+    ("com.loopme", "LoopMe"),
+    ("com.mobfox", "MobFox"),
+    ("com.admost", "AdMost"),
+    ("com.yandex.mobile.ads", "YandexAds"),
+    ("com.magnite", "Magnite"),
+    ("com.rubiconproject", "Magnite-Rubicon"),
+    ("com.bidmachine", "BidMachine"),
+    ("com.hyprmx", "HyprMX"),
+    ("com.aerserv", "AerServ"),
+    ("com.tremor", "Tremor"),
+    ("com.verizon", "VerizonMedia"),
+    ("com.oath", "VerizonMedia-Oath"),
+    ("com.superawesome", "SuperAwesome"),
+    ("com.kidoz", "Kidoz"),
+    ("com.moloco", "Moloco"),
+    ("com.liftoff", "Liftoff"),
+    ("com.digitalturbine", "DigitalTurbine"),
+    ("com.zucks", "Zucks"),
+    ("com.zedo", "Zedo"),
 ]
 
 AD_ONLY_PERMISSIONS = {
     "com.google.android.gms.permission.AD_ID",
     "com.android.providers.tv.permission.READ_EPG_DATA",
     "com.google.android.gms.permission.AD_ID_NOTIFICATION",
+    # v2 additions
+    "com.huawei.hms.permission.AD_ID",
+    "com.samsung.android.ads.permission.AD_ID",
 }
 AD_ONLY_PERMISSION_SUBSTR = ("AD_ID", "ACCESS_ADSERVICES", "AD_SERVICES")
+
+
+def is_ad_permission(name):
+    """True when a permission exists only to serve ads or expose the ad ID."""
+    if not name:
+        return False
+    if name in ("android.permission.INTERNET",
+                "android.permission.ACCESS_NETWORK_STATE"):
+        return False
+    return name in AD_ONLY_PERMISSIONS or any(
+        s in name for s in AD_ONLY_PERMISSION_SUBSTR)
+
 
 import re as _re
 
 READINESS_METHOD_RE = _re.compile(
     r"^(isLoaded|isReady|isAdLoaded|isAdReady|isRewarded|isInterstitialReady|"
-    r"isRewardedVideoAvailable|canShow|canShowAd|hasAd|isAdAvailable)$"
+    r"isRewardedVideoAvailable|isRewardedVideoReady|canShow|canShowAd|hasAd|"
+    r"isAdAvailable|isAvailable|isCached|isAdCached|isReadyToShow|isShowing|"
+    r"isVideoAvailable|hasRewardedVideo|isSplashLoaded)$"
 )
-NOOP_METHOD_RE = _re.compile(
+# Loading / init lifecycle: neutralised in every mode.
+LOAD_METHOD_RE = _re.compile(
     r"^(init|initialize|initialise|start|loadAd|loadAds|load|loadInterstitial|"
-    r"loadBanner|loadReward|loadRewarded|loadSplash|preload|precache|cacheAd|"
-    r"show|showAd|showInterstitial|showBanner|showReward|showRewarded|showSplash|"
-    r"displayAd|requestAd)$",
+    r"loadBanner|loadReward|loadRewarded|loadRewardedAd|loadRewardedVideo|"
+    r"loadSplash|loadSplashAd|preload|preloadAd|precache|cacheAd|fetchAd|"
+    r"prepareAd|prepare|requestAd|refreshAd)$",
     _re.IGNORECASE,
 )
+# Display calls: only neutralised in --aggressive (these can hang a splash).
+SHOW_METHOD_RE = _re.compile(
+    r"^(show|showAd|showInterstitial|showBanner|showReward|showRewarded|"
+    r"showRewardedAd|showRewardedVideo|showSplash|showSplashAd|showVideo|"
+    r"displayAd|display|playVideo|resumeAd)$",
+    _re.IGNORECASE,
+)
+# Backwards-compatible alias (older callers / docs refer to NOOP_METHOD_RE).
+NOOP_METHOD_RE = LOAD_METHOD_RE
 SERVER_AD_HINT_RE = _re.compile(
-    r"/(adverts?|adv|banner|splashad|promotion|rewardinfo|config)(/|\"|$)|"
-    r"(Advertisement|Advert|Banner|Promotion|SplashAd)[A-Za-z]*",
+    r"/(adverts?|adv|ads?|banner|splashad|promotion|promotions|rewardinfo|"
+    r"rewards?|adconfig|ad_config)(/|\"|$)|"
+    r"(Advertisement|Advert|Banner|Promotion|SplashAd|NativeAd|RewardedAd)"
+    r"[A-Za-z]*",
 )
 
 # ---------------------------------------------------------------------------
@@ -382,7 +496,31 @@ def find_build_tools(plat=None):
     return out
 
 
-def _download_with_progress(url, dest):
+def _sha256_file(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _verify_download(tmp, expected_sha256=None, verify_zip=True):
+    """Raise RuntimeError if a freshly downloaded file is not trustworthy."""
+    if verify_zip:
+        with open(tmp, "rb") as f:
+            magic = f.read(2)
+        if magic != b"PK":
+            raise RuntimeError(
+                "downloaded file is not a jar/zip (the server returned "
+                "something else, e.g. an error page)")
+    if expected_sha256:
+        got = _sha256_file(tmp)
+        if got != expected_sha256:
+            raise RuntimeError(
+                f"checksum mismatch: expected {expected_sha256}, got {got}")
+
+
+def _download_with_progress(url, dest, expected_sha256=None, verify_zip=True):
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
@@ -397,33 +535,50 @@ def _download_with_progress(url, dest):
 
     try:
         urllib.request.urlretrieve(url, str(tmp), reporthook=show)
+        if sys.stdout.isatty():
+            print()
+        _verify_download(tmp, expected_sha256, verify_zip)
     except Exception as e:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        raise RuntimeError(f"download failed ({url}): {e}")
-    if sys.stdout.isatty():
-        print()
+        raise RuntimeError(
+            f"download failed or failed verification ({url}): {e}")
     tmp.replace(dest)
     return dest
 
 
-def ensure_jar(name, url, tools_dir, auto_yes=False):
-    """Return Path to jar, downloading it into tools_dir if needed."""
+def ensure_jar(name, url, tools_dir, auto_yes=False, verify=None):
+    """Return Path to jar, downloading it into tools_dir if needed.
+
+    The download is checked against TOOL_CHECKSUMS (SHA-256) and must be a
+    real zip/jar, so a tampered mirror or an HTML error page is never run.
+    Pass verify=False (or --no-verify-downloads) to skip the checks.
+    """
     jar = Path(tools_dir) / name
+    if verify is None:
+        verify = VERIFY_DOWNLOADS
+    expected = TOOL_CHECKSUMS.get(name) if verify else None
     if jar.is_file() and jar.stat().st_size > 1024:
-        return jar
+        if not verify or not expected or _sha256_file(jar) == expected:
+            return jar
+        warn(f"{name} failed checksum verification; re-downloading.")
+        try:
+            jar.unlink()
+        except OSError:
+            return None
     print(f"  {name} is missing. Free download, ~20 MB, saved to {tools_dir}.")
     if auto_yes or ask_yes_no(f"Download {name} now?", default=True):
         print(f"  Downloading {name} ...")
         try:
-            _download_with_progress(url, jar)
+            _download_with_progress(url, jar, expected_sha256=expected,
+                                    verify_zip=verify)
         except RuntimeError as e:
             fail(str(e))
             fail("Check your connection and try again, or install manually.")
             return None
-        ok(f"{name} saved.")
+        ok(f"{name} saved." + (" (checksum verified)" if expected else ""))
         return jar
     return None
 
@@ -641,12 +796,7 @@ def patch_manifest(manifest_path, report):
 
     for elem in list(root.findall("uses-permission")):
         pname = elem.get(ANDROID_NAME, "")
-        if pname in AD_ONLY_PERMISSIONS or any(
-            s in pname for s in AD_ONLY_PERMISSION_SUBSTR
-        ):
-            if pname in ("android.permission.INTERNET",
-                         "android.permission.ACCESS_NETWORK_STATE"):
-                continue
+        if is_ad_permission(pname):
             removed_perms.append(pname)
             root.remove(elem)
 
@@ -698,13 +848,11 @@ def stub_method_body(header, body, kind, aggressive, grant_rewards):
         return (header + f"    .registers {max(regs,1)}\n"
                 + "    const/4 v0, 0x0\n"
                 + "    return v0\n", True)
-    lines = [header + f"    .registers {max(regs,1)}\n"]
-    if aggressive:
-        lines.append("    # ads-remover: aggressive callback-fire requested but "
-                     "skipped generically (type-unsafe); manual per-app patch needed\n")
+    lines = [header + f"    .registers {max(regs,1)}\n",
+             "    # ads-remover: ad call neutralised\n"]
     if grant_rewards:
-        lines.append("    # ads-remover: grant-rewards requested; reward granting is "
-                     "app-specific and NOT auto-patched (server may validate)\n")
+        lines.append("    # ads-remover: reward granting is app-specific and "
+                     "NOT auto-patched here (the server may validate it)\n")
     lines.append("    return-void\n")
     return ("".join(lines), True)
 
@@ -733,15 +881,21 @@ def patch_smali_file(path, aggressive, grant_rewards, report_entry):
         body = m.group("body")
         if "abstract" in header or "native" in header:
             return m.group(0)
-        if READINESS_METHOD_RE.match(mname) and ret.strip().startswith("Z"):
+        ret = ret.strip()
+        if READINESS_METHOD_RE.match(mname) and ret.startswith("Z"):
             n_false += 1
             new_body, _ = stub_method_body(header, body, "false", aggressive,
                                            grant_rewards)
             return new_body + ".end method"
-        if NOOP_METHOD_RE.match(mname) and ret.strip().startswith("V"):
+        if LOAD_METHOD_RE.match(mname) and ret.startswith("V"):
             n_void += 1
             new_body, _ = stub_method_body(header, body, "void", aggressive,
-                                            grant_rewards)
+                                           grant_rewards)
+            return new_body + ".end method"
+        if aggressive and SHOW_METHOD_RE.match(mname) and ret.startswith("V"):
+            n_void += 1
+            new_body, _ = stub_method_body(header, body, "void", aggressive,
+                                           grant_rewards)
             return new_body + ".end method"
         return m.group(0)
 
@@ -776,9 +930,12 @@ def patch_smali_tree(decoded_dir, aggressive, grant_rewards, report):
 # ---------------------------------------------------------------------------
 
 AD_LAYOUT_RE = _re.compile(
-    r"AdView|AdLayout|AdBanner|com\.google\.android\.gms\.ads|"
-    r"com\.facebook\.ads|applovin|ironsource|vungle|startapp|inmobi|"
-    r"chartboost|mopub|tapjoy|anythink|openadsdk|TTAd|GDTAd",
+    r"AdView|AdLayout|AdBanner|AdContainer|AdFrameLayout|NativeAdView|"
+    r"RewardedAdView|BannerAdView|com\.google\.android\.gms\.ads|"
+    r"com\.facebook\.ads|com\.amazon\.device\.ads|com\.huawei\.hms\.ads|"
+    r"applovin|ironsource|vungle|startapp|inmobi|chartboost|mopub|tapjoy|"
+    r"anythink|openadsdk|TTAd|GDTAd|mintegral|smaato|criteo|ogury|teads|"
+    r"loopme|mobfox|yandex\.mobile\.ads|bidmachine|pangle|kwad|baidu\.mobads",
 )
 
 EMPTY_LAYOUT = """<?xml version="1.0" encoding="utf-8"?>
@@ -1120,6 +1277,146 @@ def print_summary(report, out_apk, report_path, plat):
 
 
 # ---------------------------------------------------------------------------
+# Optional config file (.ads-remover.json) and SDK selection
+# ---------------------------------------------------------------------------
+
+CONFIG_NAMES = (".ads-remover.json", "ads-remover.json")
+
+
+def load_config(path=None):
+    """Load a JSON config. Explicit path wins, else env, cwd, then script dir."""
+    candidates = []
+    if path:
+        candidates.append(Path(path).expanduser())
+    else:
+        env = os.environ.get("ADS_REMOVER_CONFIG")
+        if env:
+            candidates.append(Path(env).expanduser())
+        for name in CONFIG_NAMES:
+            candidates.append(Path.cwd() / name)
+            candidates.append(SCRIPT_DIR / name)
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                cfg = json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise RuntimeError(f"invalid config file {cand}: {e}")
+            if not isinstance(cfg, dict):
+                raise RuntimeError(
+                    f"invalid config file {cand}: not a JSON object")
+            cfg["_path"] = str(cand)
+            return cfg
+    return {}
+
+
+def apply_config(cfg):
+    """Merge extra SDKs/permissions from a config file into the live tables."""
+    global AD_ONLY_PERMISSION_SUBSTR
+    for prefix, label in (cfg.get("extra_sdk_prefixes") or {}).items():
+        AD_SDK_SMALI_PREFIXES.setdefault(prefix, label)
+    for item in cfg.get("extra_manifest_markers") or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            AD_MANIFEST_MARKERS.append((item[0], item[1]))
+    for perm in cfg.get("extra_permissions") or []:
+        AD_ONLY_PERMISSIONS.add(perm)
+    for sub in cfg.get("extra_permission_substrings") or []:
+        AD_ONLY_PERMISSION_SUBSTR = tuple(
+            sorted(set(AD_ONLY_PERMISSION_SUBSTR) | {sub}))
+    return cfg
+
+
+def restrict_to_sdks(labels):
+    """Keep only the named SDK labels (case-insensitive) in the patch tables.
+
+    Returns how many smali prefixes remain (0 means nothing matched).
+    """
+    global AD_SDK_SMALI_PREFIXES, AD_MANIFEST_MARKERS
+    wanted = {s.lower() for s in labels if s}
+    if not wanted:
+        return len(AD_SDK_SMALI_PREFIXES)
+    AD_SDK_SMALI_PREFIXES = {k: v for k, v in AD_SDK_SMALI_PREFIXES.items()
+                             if v.lower() in wanted}
+    AD_MANIFEST_MARKERS = [(m, v) for m, v in AD_MANIFEST_MARKERS
+                           if v.lower() in wanted]
+    return len(AD_SDK_SMALI_PREFIXES)
+
+
+def known_sdk_labels():
+    return sorted(set(AD_SDK_SMALI_PREFIXES.values())
+                  | {v for _, v in AD_MANIFEST_MARKERS})
+
+
+def print_sdks():
+    labels = known_sdk_labels()
+    print(c(f"ads-remover {__version__} - {len(labels)} ad SDKs known", "bold"))
+    for label in labels:
+        prefixes = sorted(k for k, v in AD_SDK_SMALI_PREFIXES.items()
+                          if v == label)
+        detail = ", ".join(prefixes) or "(manifest only)"
+        print(f"  {label:22} {detail}")
+    print("\nUse --sdks NAME[,NAME] to patch only some of these.")
+
+
+# ---------------------------------------------------------------------------
+# Post-patch verification
+# ---------------------------------------------------------------------------
+
+def verify_manifest_clean(manifest_path):
+    """Return ad components/permissions still present after patching."""
+    remaining = []
+    try:
+        root = ET.parse(manifest_path).getroot()
+    except (OSError, ET.ParseError):
+        return ["<manifest unreadable>"]
+    for elem in root.iter():
+        cname = elem.get(ANDROID_NAME, "")
+        if cname and manifest_label(cname):
+            remaining.append(cname)
+    for elem in root.findall("uses-permission"):
+        pname = elem.get(ANDROID_NAME, "")
+        if is_ad_permission(pname):
+            remaining.append(pname)
+    return remaining
+
+
+def verify_output_apk(path):
+    """Structurally check the rebuilt APK. Never raises."""
+    p = Path(path)
+    res = {"exists": False, "valid_zip": False, "has_manifest": False,
+           "has_dex": False, "signed": False, "bytes": None}
+    if not p.is_file():
+        return res
+    res["exists"] = True
+    try:
+        res["bytes"] = p.stat().st_size
+    except OSError:
+        pass
+    try:
+        with zipfile.ZipFile(p) as z:
+            names = z.namelist()
+        res["valid_zip"] = True
+        res["has_manifest"] = "AndroidManifest.xml" in names
+        res["has_dex"] = any(n.endswith(".dex") for n in names)
+        res["signed"] = any(
+            n.startswith("META-INF/") and n.rsplit(".", 1)[-1].upper()
+            in ("RSA", "DSA", "EC", "SF") for n in names)
+    except Exception as e:  # report, never crash
+        res["error"] = str(e)
+        return res
+    # v2+ signatures live in the APK Signing Block, not a zip entry.
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8 * 1024 * 1024))
+            if b"APK Sig Block 42" in f.read():
+                res["signed"] = True
+    except OSError:
+        pass
+    return res
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1127,10 +1424,10 @@ def build_parser():
     ap = argparse.ArgumentParser(
         description="Remove ads from an APK file (Linux, Windows, macOS, Termux). "
                     "Run with no arguments for the step-by-step wizard.")
-    ap.add_argument("input", nargs="?",
-                    help="input .apk file (omit for wizard)")
+    ap.add_argument("input", nargs="*",
+                    help="input .apk file(s), or a folder of them (omit for wizard)")
     ap.add_argument("-o", "--output", default=None,
-                    help="output .apk path (default: <name>-noads.apk)")
+                    help="output .apk path; with several inputs, an output folder")
     ap.add_argument("--dry-run", action="store_true",
                     help="unpack + analyse + report only, skip rebuild/sign")
     ap.add_argument("--aggressive", action="store_true",
@@ -1141,26 +1438,226 @@ def build_parser():
                     help="debug keystore (auto-created when the system signer is used)")
     ap.add_argument("--tools-dir", default=str(DEFAULT_TOOLS_DIR),
                     help="folder for auto-downloaded helper files")
+    ap.add_argument("--config", default=None,
+                    help="JSON config file (default: ./.ads-remover.json)")
+    ap.add_argument("--sdks", default=None,
+                    help="comma-separated SDK names to patch (see --list-sdks)")
+    ap.add_argument("--list-sdks", action="store_true",
+                    help="list the ad SDKs this tool knows and exit")
     ap.add_argument("--check-deps", action="store_true",
                     help="show available tools and exit")
     ap.add_argument("--json", action="store_true",
-                    help="machine-readable output for --check-deps")
+                    help="machine-readable output (--check-deps, or the final report)")
     ap.add_argument("--setup", action="store_true",
                     help="download missing helper files, show install hints")
+    ap.add_argument("--no-verify-downloads", action="store_true",
+                    help="skip SHA-256 checks on downloaded helper jars")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="non-interactive: auto-accept downloads, never prompt")
     ap.add_argument("--keep-workdir", action="store_true",
                     help="keep the unpacked app folder for inspection")
     ap.add_argument("--verbose", action="store_true",
                     help="show tool output while working")
+    ap.add_argument("--version", action="version",
+                    version=f"ads-remover {__version__}")
     return ap
 
 
+def expand_inputs(inputs):
+    """Expand a mix of files and folders into a sorted list of .apk Paths."""
+    files = []
+    for item in inputs:
+        p = Path(item)
+        if p.is_dir():
+            files += sorted(p.glob("*.apk"))
+        else:
+            files.append(p)
+    return files
+
+
+def prepare_tools(args, plat, tools_dir):
+    """Resolve Java + apktool + signer once. Returns (ctx, exit_code)."""
+    total = 5 if not args.dry_run else 4
+    step(1, total, "Checking tools ...")
+    java = find_java(plat)
+    if not java:
+        warn("Java 17+ was not found - it is required to unpack apps.")
+        if args.yes:
+            print("Non-interactive mode: run 'python remove_ads.py --setup -y' "
+                  "to install it first.")
+            print(java_hint(plat))
+            return None, 3
+        if try_install_java(plat, auto_yes=False):
+            java = find_java(plat)
+            ok(f"Java installed: {java}")
+        else:
+            fail("Java is still missing.")
+            print(java_hint(plat))
+            return None, 3
+    ok(f"Java: {java}")
+    prefix, how = apktool_prefix(java, find_apktool_native(plat), tools_dir,
+                                 auto_yes=args.yes)
+    if prefix is None:
+        fail(f"apktool unavailable ({how}).")
+        print("Run:  python remove_ads.py --setup")
+        return None, 3
+    ok(f"apktool: {how}")
+    bt = find_build_tools(plat)
+    uber = (tools_dir / UBER_JAR) if (tools_dir / UBER_JAR).is_file() else None
+    if not args.dry_run and not (bt["zipalign"] and bt["apksigner"]) \
+            and not uber and not shutil.which("jarsigner"):
+        warn("No system signer found. The bundled fallback needs one download.")
+        uber_dl = ensure_jar(UBER_JAR, UBER_URL, tools_dir, auto_yes=args.yes)
+        if uber_dl is None and not args.yes:
+            fail("Cannot sign without a signer. Run --setup first.")
+            return None, 3
+        uber = uber_dl
+    ctx = {"apktool_prefix": prefix, "java": java,
+           "zipalign": bt["zipalign"], "apksigner": bt["apksigner"],
+           "jarsigner": shutil.which("jarsigner"),
+           "uber_jar": str(uber) if uber else None,
+           "tools_dir": str(tools_dir), "auto_yes": args.yes,
+           "verbose": args.verbose}
+    return ctx, 0
+
+
+def process_one(input_path, output_path, args, plat, ctx, report_path=None,
+                label=None):
+    """Patch a single APK. Returns (exit_code, report)."""
+    total = 5 if not args.dry_run else 4
+    if label:
+        print(c(f"\n=== {label} ===", "bold"))
+    print(c("\nads-remover", "bold") + f"  ({plat['system'] or 'os'}"
+          + (" / termux" if plat["is_termux"] else "") + ")")
+    print(f"Input : {input_path}\nOutput: {output_path}\n")
+
+    report = {"version": __version__, "input": str(input_path),
+              "aggressive": args.aggressive,
+              "grant_rewards": args.grant_rewards,
+              "platform": ("termux" if plat["is_termux"] else plat["system"])}
+
+    step(2, total, "Unpacking the app (apktool, may take a minute) ...")
+    workdir = Path(tempfile.mkdtemp(prefix="ads-remover-"))
+    decoded = workdir / "decoded"
+    prefix = ctx["apktool_prefix"]
+    try:
+        if args.verbose:
+            rc = run_live([*prefix, "d", "-f", str(input_path), "-o",
+                           str(decoded)])
+        else:
+            p = run([*prefix, "d", "-f", str(input_path), "-o", str(decoded)])
+            rc = p.returncode
+            if rc != 0:
+                tail = ((p.stdout or "") + (p.stderr or ""))[-2000:]
+                fail("Unpacking failed:")
+                print(tail, file=sys.stderr)
+                print("This usually means the APK needs a newer apktool "
+                      "(-run --setup to refresh) or the file is corrupted.")
+                return 4, report
+        if rc != 0 or not (decoded / "AndroidManifest.xml").is_file():
+            fail("Unpacking failed or produced no manifest.")
+            return 4, report
+        ok("Unpacked.")
+
+        step(3, total, "Removing ads ...")
+        patch_manifest(decoded / "AndroidManifest.xml", report)
+        patch_smali_tree(decoded, args.aggressive, args.grant_rewards, report)
+        patch_resources(decoded, report)
+        scan_server_hints(decoded, report)
+        residual = verify_manifest_clean(decoded / "AndroidManifest.xml")
+        report["verification"] = {"manifest_residual_ad_entries": residual}
+        ok(f"manifest entries removed: "
+           f"{len(report.get('manifest_removed_components', []))}, "
+           f"code sections disabled: {report.get('smali_patched_files', 0)}, "
+           f"layouts emptied: {len(report.get('layouts_neutralised', []))}.")
+        if residual:
+            warn(f"{len(residual)} ad entr(ies) still present in the manifest "
+                 "(see report verification).")
+
+        if args.dry_run:
+            step(4, total, "Writing report (dry run, no rebuild) ...")
+            out_report = (Path(report_path) if report_path
+                          else Path("ads-report.json"))
+            out_report.write_text(json.dumps(report, indent=2),
+                                  encoding="utf-8")
+            ok(f"Report: {out_report}")
+            print(f"Unpacked app kept at: {decoded} (delete manually)")
+            try:
+                print_summary(report, "(no output - dry run)",
+                              out_report, plat)
+            except OSError:
+                pass
+            print(f"\nWork folder kept: {workdir}")
+            return 0, report
+
+        step(4, total, "Rebuilding the app ...")
+        try:
+            rebuild_and_sign(decoded, Path(output_path),
+                             Path(args.keystore).expanduser(), ctx)
+        except RuntimeError as e:
+            fail(str(e))
+            return 5, report
+        step(5, total, "Writing report ...")
+        out_apk = Path(output_path)
+        report["output"] = str(out_apk)
+        try:
+            report["output_bytes"] = out_apk.stat().st_size
+        except OSError:
+            report["output_bytes"] = None
+        report["verification"]["output"] = verify_output_apk(out_apk)
+        out_report = (Path(report_path) if report_path
+                      else out_apk.with_suffix(".report.json"))
+        try:
+            out_report.write_text(json.dumps(report, indent=2),
+                                  encoding="utf-8")
+        except OSError as e:
+            warn(f"Could not write report: {e}")
+        print_summary(report, out_apk, out_report, plat)
+        v = report["verification"]["output"]
+        if v.get("valid_zip") and v.get("has_manifest") and v.get("signed"):
+            ok("Verified: output is a valid, signed APK.")
+        else:
+            warn("Output verification incomplete - see the report.")
+        return 0, report
+    except KeyboardInterrupt:
+        fail("Cancelled. Nothing was installed or changed on your phone.")
+        return 130, report
+    finally:
+        if not (args.dry_run or args.keep_workdir):
+            shutil.rmtree(workdir, ignore_errors=True)
+        elif not args.dry_run and args.keep_workdir:
+            print(f"\nWork folder kept: {workdir}")
+
+
 def main(argv=None):
+    global VERIFY_DOWNLOADS
     plat = detect_platform()
     ap = build_parser()
     args = ap.parse_args(argv)
+    if args.no_verify_downloads:
+        VERIFY_DOWNLOADS = False
     tools_dir = Path(args.tools_dir).expanduser()
+
+    # Optional config file + SDK selection (applied before anything else).
+    try:
+        cfg = load_config(args.config)
+        if cfg:
+            apply_config(cfg)
+            if not (args.json or args.check_deps):
+                print(f"Config: {cfg['_path']}")
+    except RuntimeError as e:
+        fail(str(e))
+        return 2
+    if args.sdks:
+        matched = restrict_to_sdks(
+            [s.strip() for s in args.sdks.split(",") if s.strip()])
+        if matched == 0:
+            warn(f"No known SDK matched --sdks {args.sdks!r}; "
+                 "run --list-sdks to see the names.")
+
+    if args.list_sdks:
+        print_sdks()
+        return 0
 
     if args.check_deps:
         deps = check_deps(tools_dir, plat)
@@ -1180,162 +1677,76 @@ def main(argv=None):
             print("\nCancelled.")
             return 130
 
-    interactive = not args.input and not args.yes and sys.stdin.isatty()
-    if not args.input:
+    inputs = list(args.input)
+    interactive = not inputs and not args.yes and sys.stdin.isatty()
+    if not inputs:
         if interactive:
             try:
                 args = run_wizard(args, plat)
             except KeyboardInterrupt:
                 print("\nCancelled. Nothing was changed.")
                 return 130
+            inputs = [args.input]
         else:
             ap.print_help()
             print("\nTip: run with no arguments for the step-by-step wizard, "
                   "or give an APK:  python remove_ads.py app.apk")
             return 2
-    if not args.output:
-        args.output = default_output_path(args.input)
 
-    good, msg = validate_apk(args.input)
-    if not good:
-        fail(msg)
-        if "not found" in msg.lower():
-            print("Tip: drag-and-drop the file onto this window to paste its path.")
+    files = expand_inputs(inputs)
+    if not files:
+        fail("No .apk files found in the given path(s).")
         return 2
+    for f in files:
+        good, msg = validate_apk(str(f))
+        if not good:
+            fail(msg)
+            if "not found" in msg.lower():
+                print("Tip: drag-and-drop the file onto this window to "
+                      "paste its path.")
+            return 2
 
-    total = 5 if not args.dry_run else 4
-    print(c("\nads-remover", "bold") + f"  ({plat['system'] or 'os'}"
-          + (" / termux" if plat["is_termux"] else "") + ")")
-    print(f"Input : {args.input}\nOutput: {args.output}\n")
+    ctx, code = prepare_tools(args, plat, tools_dir)
+    if ctx is None:
+        return code
 
-    # --- tools ---
-    step(1, total, "Checking tools ...")
-    java = find_java(plat)
-    if not java:
-        warn("Java 17+ was not found - it is required to unpack apps.")
-        if args.yes:
-            print("Non-interactive mode: run 'python remove_ads.py --setup -y' "
-                  "to install it first.")
-            print(java_hint(plat))
-            return 3
-        if try_install_java(plat, auto_yes=False):
-            java = find_java(plat)
-            ok(f"Java installed: {java}")
-        else:
-            fail("Java is still missing.")
-            print(java_hint(plat))
-            return 3
-    ok(f"Java: {java}")
-    prefix, how = apktool_prefix(java, find_apktool_native(plat), tools_dir,
-                                 auto_yes=args.yes)
-    if prefix is None:
-        fail(f"apktool unavailable ({how}).")
-        print("Run:  python remove_ads.py --setup")
-        return 3
-    ok(f"apktool: {how}")
-    bt = find_build_tools(plat)
-    uber = (tools_dir / UBER_JAR) if (tools_dir / UBER_JAR).is_file() else None
-    if not args.dry_run and not (bt["zipalign"] and bt["apksigner"]) \
-            and not uber and not shutil.which("jarsigner"):
-        # Offer the fallback now rather than failing at the end.
-        warn("No system signer found. The bundled fallback needs one download.")
-        uber_dl = ensure_jar(UBER_JAR, UBER_URL, tools_dir, auto_yes=args.yes)
-        if uber_dl is None and not args.yes:
-            fail("Cannot sign without a signer. Run --setup first.")
-            return 3
-        uber = uber_dl
-    ctx = {"apktool_prefix": prefix, "java": java,
-           "zipalign": bt["zipalign"], "apksigner": bt["apksigner"],
-           "jarsigner": shutil.which("jarsigner"),
-           "uber_jar": str(uber) if uber else None,
-           "tools_dir": str(tools_dir), "auto_yes": args.yes,
-           "verbose": args.verbose}
-
-    report = {"input": str(args.input), "aggressive": args.aggressive,
-              "grant_rewards": args.grant_rewards,
-              "platform": ("termux" if plat["is_termux"] else plat["system"])}
-
-    # --- decode ---
-    step(2, total, "Unpacking the app (apktool, may take a minute) ...")
-    workdir = Path(tempfile.mkdtemp(prefix="ads-remover-"))
-    decoded = workdir / "decoded"
-    try:
-        if args.verbose:
-            rc = run_live([*prefix, "d", "-f", str(args.input), "-o",
-                           str(decoded)])
-        else:
-            p = run([*prefix, "d", "-f", str(args.input), "-o", str(decoded)])
-            rc = p.returncode
-            if rc != 0:
-                tail = ((p.stdout or "") + (p.stderr or ""))[-2000:]
-                fail("Unpacking failed:")
-                print(tail, file=sys.stderr)
-                print("This usually means the APK needs a newer apktool "
-                      "(-run --setup to refresh) or the file is corrupted.")
-                return 4
-        if rc != 0 or not (decoded / "AndroidManifest.xml").is_file():
-            fail("Unpacking failed or produced no manifest.")
-            return 4
-        ok("Unpacked.")
-
-        # --- patch ---
-        step(3, total, "Removing ads ...")
-        patch_manifest(decoded / "AndroidManifest.xml", report)
-        patch_smali_tree(decoded, args.aggressive, args.grant_rewards, report)
-        patch_resources(decoded, report)
-        scan_server_hints(decoded, report)
-        ok(f"manifest entries removed: "
-           f"{len(report.get('manifest_removed_components', []))}, "
-           f"code sections disabled: {report.get('smali_patched_files', 0)}, "
-           f"layouts emptied: {len(report.get('layouts_neutralised', []))}.")
-
-        if args.dry_run:
-            step(4, total, "Writing report (dry run, no rebuild) ...")
-            out_report = Path("ads-report.json")
-            out_report.write_text(json.dumps(report, indent=2),
-                                  encoding="utf-8")
-            ok(f"Report: {out_report}")
-            print(f"Unpacked app kept at: {decoded} (delete manually)")
-            try:
-                print_summary(report, "(no output - dry run)",
-                              out_report, plat)
-            except OSError:
-                pass
-            # keep workdir for inspection on dry-run
-            print(f"\nWork folder kept: {workdir}")
-            return 0
-
-        # --- rebuild + sign ---
-        step(4, total, "Rebuilding the app ...")
+    single = len(files) == 1
+    outdir = None
+    if not single and args.output:
+        outdir = Path(args.output)
         try:
-            rebuild_and_sign(decoded, Path(args.output),
-                             Path(args.keystore).expanduser(), ctx)
-        except RuntimeError as e:
-            fail(str(e))
-            return 5
-        step(5, total, "Writing report ...")
-        out_apk = Path(args.output)
-        report["output"] = str(out_apk)
-        try:
-            report["output_bytes"] = out_apk.stat().st_size
-        except OSError:
-            report["output_bytes"] = None
-        out_report = out_apk.with_suffix(".report.json")
-        try:
-            out_report.write_text(json.dumps(report, indent=2),
-                                  encoding="utf-8")
+            outdir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            warn(f"Could not write report: {e}")
-        print_summary(report, out_apk, out_report, plat)
-        return 0
-    except KeyboardInterrupt:
-        fail("Cancelled. Nothing was installed or changed on your phone.")
-        return 130
-    finally:
-        if not (args.dry_run or args.keep_workdir):
-            shutil.rmtree(workdir, ignore_errors=True)
-        elif not args.dry_run and args.keep_workdir:
-            print(f"\nWork folder kept: {workdir}")
+            fail(f"Cannot create output folder: {e}")
+            return 2
+
+    results = []
+    for i, f in enumerate(files):
+        if single:
+            out = args.output or default_output_path(f)
+            rp = None
+            label = None
+        else:
+            out = str(outdir / (f.stem + "-noads.apk")) if outdir \
+                else default_output_path(f)
+            rp = str(Path(out).with_suffix(".report.json"))
+            label = f"[{i + 1}/{len(files)}] {f.name}"
+        code, report = process_one(str(f), out, args, plat, ctx,
+                                   report_path=rp, label=label)
+        results.append((f, code, report))
+
+    if not single:
+        done = sum(1 for _, c, _ in results if c == 0)
+        print(c(f"\nBatch finished: {done}/{len(results)} succeeded.", "bold"))
+        for f, c, _ in results:
+            print(f"  {'OK ' if c == 0 else 'XX '} {f.name} (exit {c})")
+
+    if args.json:
+        payload = ([r for _, _, r in results] if not single
+                   else (results[0][2] if results else None))
+        print(json.dumps(payload, indent=2))
+
+    return max((c for _, c, _ in results), default=0)
 
 
 if __name__ == "__main__":

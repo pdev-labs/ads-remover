@@ -31,6 +31,10 @@ on:
         required: false
         default: false
         type: boolean
+      sdks:
+        description: "Comma-separated SDKs to patch (default: all). See --list-sdks"
+        required: false
+        type: string
       publish_release:
         description: "Publish result as a GitHub Release (public download link)"
         required: false
@@ -79,6 +83,7 @@ jobs:
           OUT_NAME: ${{ inputs.output_name }}
           IN_AGG: ${{ inputs.aggressive }}
           IN_GR: ${{ inputs.grant_rewards }}
+          IN_SDKS: ${{ inputs.sdks }}
           IN_REL: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
@@ -87,6 +92,7 @@ jobs:
           out="${OUT_NAME:-app-noads.apk}"
           agg="${IN_AGG:-false}"
           gr="${IN_GR:-false}"
+          sdks="${IN_SDKS:-}"
           rel="${IN_REL:-false}"
 
           # push event: use the committed APK
@@ -120,6 +126,7 @@ jobs:
             echo "out=$out"
             echo "aggressive=$agg"
             echo "grant_rewards=$gr"
+            echo "sdks=$sdks"
             echo "release=$rel"
           } >> "$GITHUB_OUTPUT"
 
@@ -153,7 +160,9 @@ jobs:
       - name: Analyse APK (dry run, written to the log)
         shell: bash
         continue-on-error: true
-        run: python remove_ads.py "${{ steps.get.outputs.input }}" --dry-run -y
+        run: |
+          python remove_ads.py --list-sdks
+          python remove_ads.py "${{ steps.get.outputs.input }}" --dry-run -y
 
       - name: Remove ads and rebuild
         id: build
@@ -163,11 +172,13 @@ jobs:
           OUT: work/${{ steps.req.outputs.out }}
           AGG: ${{ steps.req.outputs.aggressive }}
           GR: ${{ steps.req.outputs.grant_rewards }}
+          SDKS: ${{ steps.req.outputs.sdks }}
         run: |
           set -euo pipefail
           args=( "$IN" -o "$OUT" -y )
           if [ "$AGG" = "true" ]; then args+=( --aggressive ); fi
           if [ "$GR"  = "true" ]; then args+=( --grant-rewards ); fi
+          if [ -n "${SDKS:-}" ]; then args+=( --sdks "$SDKS" ); fi
           python remove_ads.py "${args[@]}"
           ls -l "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
@@ -204,6 +215,8 @@ jobs:
                   "layouts_neutralised": len(d.get("layouts_neutralised", [])),
                   "sdks": list(d.get("smali_patched_sdks", {}).keys()),
                   "server_ad_hints": len(d.get("server_ad_hints", [])),
+                  "output_verified": bool(
+                      (d.get("verification") or {}).get("output", {}).get("valid_zip")),
               }, indent=2) + "\n```\n"
           except Exception as e:
               body += "(report unavailable: %s)\n" % e

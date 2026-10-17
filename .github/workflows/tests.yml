@@ -19,7 +19,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python test_remove_ads.py
       - run: python test_cross_platform.py
+      - run: python test_features.py
       - run: python remove_ads.py --help
+      - run: python remove_ads.py --version
+      - run: python remove_ads.py --list-sdks
       # informational only: exit 3 just means Java/tools are absent on the runner
       - run: python remove_ads.py --check-deps || true
 
